@@ -1,0 +1,17 @@
+name: equidock
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - numpy=1.24
+  - joblib=1.2.0
+  - cython
+  - pip:
+      - torch==2.3.1 --index-url https://download.pytorch.org/whl/cu121
+      - dgl==2.1.0 --index-url https://data.dgl.ai/wheels/cu121
+      - dgllife==0.3.0
+      - biopandas==0.2.8
+      - pot==0.7.0
+      - rdkit-pypi==2022.9.5

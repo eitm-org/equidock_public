@@ -16,7 +16,7 @@ from src.utils.io import create_dir
 
 dataset = 'dips'
 method_name = 'equidock'
-remove_clashes = False  # Set to true if you want to remove (most of the) steric clashes. Will increase run time.
+remove_clashes = True  # Set to true if you want to remove (most of the) steric clashes. Will increase run time.
 if remove_clashes:
     method_name = method_name + '_no_clashes'
     print('Inference with postprocessing to remove clashes')
@@ -82,7 +82,7 @@ def get_residues(pdb_filename):
     return residues
 
 
-
+# UPDATED TO REMOVE GROUND TRUTH CODE FOR OUR TESTING PURPOSES
 def main(args):
 
     ## Pre-trained models.
@@ -118,35 +118,46 @@ def main(args):
 
     time_list = []
 
-    input_dir = './test_sets_pdb/' + dataset + '_test_random_transformed/random_transformed/'
-    ground_truth_dir = './test_sets_pdb/' + dataset + '_test_random_transformed/complexes/'
-    output_dir = './test_sets_pdb/' + dataset + '_' + method_name + '_results/'
+    # input_dir = './test_sets_pdb/' + dataset + '_test_random_transformed/random_transformed/'
+    # ground_truth_dir = './test_sets_pdb/' + dataset + '_test_random_transformed/complexes/'
+    # output_dir = './test_sets_pdb/' + dataset + '_' + method_name + '_results/'
 
-    input_dir = './test_sets_pdb/jean/'
-    ground_truth_dir = './test_sets_pdb/jean/'
-    output_dir = './test_sets_pdb/jean_out/'
-    # create_dir(output_dir)
+    # input_dir = './test_sets_pdb/jean/'
+    # ground_truth_dir = './test_sets_pdb/jean/'
+    # output_dir = './test_sets_pdb/jean_out/'
+    # # create_dir(output_dir)
+
+    input_dir = '/mnt/datastore/ztraul/BindingTestSet/Binders' # folder with our binders
 
     pdb_files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f)) and f.endswith('.pdb')]
     for file in pdb_files:
 
-        if not file.endswith('_l_b.pdb'):
-            continue
-        ll = len('_l_b.pdb')
-        ligand_filename = os.path.join(input_dir, file[:-ll] + '_l_b' + '.pdb')
-        receptor_filename = os.path.join(ground_truth_dir, file[:-ll] + '_r_b' + '_COMPLEX.pdb')
-        gt_ligand_filename = os.path.join(ground_truth_dir, file[:-ll] + '_l_b' + '_COMPLEX.pdb')
-        out_filename = file[:-ll] + '_l_b' + '_' + method_name.upper() + '.pdb'
+        if file.str.contains('RFDiffusion'): # our PSMA designs
+            receptor_filename = '/mnt/datastore/ztraul/BindingTestSet/Targets/PSMA.pdb'
+            output_dir = '/home/mubale/equidock_outputs/PSMA'
+        else: # Adaptyv EGFR designs
+            receptor_filename = '/mnt/datastore/ztraul/BindingTestSet/Targets/EGFR.pdb'
+            output_dir = '/home/mubale/equidock_outputs/EGFR'
 
+            
+        ## specific naming convention for DB5 dataset
+        # if not file.endswith('_l_b.pdb'):
+        #     continue
+        # ll = len('_l_b.pdb')
+        # ligand_filename = os.path.join(input_dir, file[:-ll] + '_l_b' + '.pdb')
+        # receptor_filename = os.path.join(ground_truth_dir, file[:-ll] + '_r_b' + '_COMPLEX.pdb')
+        # gt_ligand_filename = os.path.join(ground_truth_dir, file[:-ll] + '_l_b' + '_COMPLEX.pdb')
+        # out_filename = file[:-ll] + '_l_b' + '_' + method_name.upper() + '.pdb'
+
+        ligand_filename = os.path.join(input_dir, file)
+        out_filename = file.replace('.pdb', f'_{method_name.upper()}.pdb')
         print(' inference on file = ', ligand_filename)
-
 
         start = dt.now()
 
+        # load ligand and receptor pdbs
         ppdb_ligand = PandasPdb().read_pdb(ligand_filename)
-
         unbound_ligand_all_atoms_pre_pos = ppdb_ligand.df['ATOM'][['x_coord', 'y_coord', 'z_coord']].to_numpy().squeeze().astype(np.float32)
-
 
         def get_nodes_coors_numpy(filename, all_atoms=False):
             df = PandasPdb().read_pdb(filename).df['ATOM']
@@ -154,12 +165,11 @@ def main(args):
                 return torch.from_numpy(df[df['atom_name'] == 'CA'][['x_coord', 'y_coord', 'z_coord']].to_numpy().squeeze().astype(np.float32))
             return torch.from_numpy(df[['x_coord', 'y_coord', 'z_coord']].to_numpy().squeeze().astype(np.float32))
 
-        gt_ligand_nodes_coors = get_nodes_coors_numpy(gt_ligand_filename, all_atoms=True)
-        gt_receptor_nodes_coors = get_nodes_coors_numpy(receptor_filename, all_atoms=True)
-        initial_ligand_nodes_coors = get_nodes_coors_numpy(ligand_filename, all_atoms=True)
+        # gt_ligand_nodes_coors = get_nodes_coors_numpy(gt_ligand_filename, all_atoms=True)
+        receptor_nodes_coors = get_nodes_coors_numpy(receptor_filename, all_atoms=True)
+        # initial_ligand_nodes_coors = get_nodes_coors_numpy(ligand_filename, all_atoms=True) --> i think we dont need this
 
-
-
+        # preprocess proteins for graph input
         unbound_predic_ligand, \
         unbound_predic_receptor, \
         bound_ligand_repres_nodes_loc_clean_array,\
@@ -182,19 +192,17 @@ def main(args):
         if args['input_edge_feats_dim'] < 0:
             args['input_edge_feats_dim'] = ligand_graph.edata['he'].shape[1]
 
-
         ligand_graph.ndata['new_x'] = ligand_graph.ndata['x']
-
         assert np.linalg.norm(bound_ligand_repres_nodes_loc_clean_array - ligand_graph.ndata['x'].detach().cpu().numpy()) < 1e-1
 
+        # run equidock model
         # Create a batch of a single DGL graph
         batch_hetero_graph = batchify_and_create_hetero_graphs_inference(ligand_graph, receptor_graph)
-
         batch_hetero_graph = batch_hetero_graph.to(args['device'])
+
         model_ligand_coors_deform_list, \
         model_keypts_ligand_list, model_keypts_receptor_list, \
         all_rotation_list, all_translation_list = model(batch_hetero_graph, epoch=0)
-
 
         rotation = all_rotation_list[0].detach().cpu().numpy()
         translation = all_translation_list[0].detach().cpu().numpy()
@@ -204,6 +212,7 @@ def main(args):
 
         unbound_ligand_new_pos = (rotation @ unbound_ligand_all_atoms_pre_pos.T).T+translation
 
+        # remove steric clashes
         euler_angles_finetune = torch.zeros([3], requires_grad=True)
         translation_finetune = torch.zeros([3], requires_grad=True)
         ligand_th = (get_rot_mat(euler_angles_finetune) @ torch.from_numpy(unbound_ligand_new_pos).T).T + translation_finetune
@@ -213,7 +222,7 @@ def main(args):
             non_int_loss_item = 100.
             it = 0
             while non_int_loss_item > 0.5 and it < 2000:
-                non_int_loss = compute_body_intersection_loss(ligand_th, gt_receptor_nodes_coors, sigma=8, surface_ct=8)
+                non_int_loss = compute_body_intersection_loss(ligand_th, receptor_nodes_coors, sigma=8, surface_ct=8)
                 non_int_loss_item = non_int_loss.item()
                 eta = 1e-3
                 if non_int_loss < 2.:
