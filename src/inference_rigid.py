@@ -127,16 +127,16 @@ def main(args):
     # output_dir = './test_sets_pdb/jean_out/'
     # # create_dir(output_dir)
 
-    input_dir = '/mnt/datastore/ztraul/BindingTestSet/Binders' # folder with our binders
+    input_dir = '/mnt/datastore/mubale/BindingTestSet/Binders' # folder with our binders
 
     pdb_files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f)) and f.endswith('.pdb')]
     for file in pdb_files:
 
-        if file.str.contains('RFDiffusion'): # our PSMA designs
-            receptor_filename = '/mnt/datastore/ztraul/BindingTestSet/Targets/PSMA.pdb'
+        if 'RFDiffusion' in file: # our PSMA designs
+            receptor_filename = '/mnt/datastore/mubale/BindingTestSet/Targets/PSMA.pdb'
             output_dir = '/home/mubale/equidock_outputs/PSMA'
         else: # Adaptyv EGFR designs
-            receptor_filename = '/mnt/datastore/ztraul/BindingTestSet/Targets/EGFR.pdb'
+            receptor_filename = '/mnt/datastore/mubale/BindingTestSet/Targets/EGFR.pdb'
             output_dir = '/home/mubale/equidock_outputs/EGFR'
 
             
