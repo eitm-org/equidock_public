@@ -3,22 +3,22 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.9
+  - python=3.11
   - pip
   - numpy=1.24
   - joblib=1.2.0
   - cython
+  - setuptools=80.9.0
+  - packaging=25.0
+  - rdkit
   - pip:
       - torch==2.4.0+cu121
       - torchvision==0.17.1+cu121
-      - torchaudio==2.4.0+cu121
-      - dgl==2.4.0 -f https://data.dgl.ai/wheels/torch-2.4/cu121/repo.html
+      - torchaudio==2.0.2+cu121
+      - dgl==2.4.0
       - dgllife==0.3.0
       - biopandas==0.2.8
       - pot==0.7.0
-      - rdkit-pypi==2022.9.5
       - torchdata==0.6.1
-      - packaging==25.0
-      - setuptools==80.9.0
       - pyyaml==6.0.3
       - pydantic==2.12.3

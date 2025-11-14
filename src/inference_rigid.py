@@ -1,5 +1,5 @@
 import os
-
+import pandas as pd
 import torch
 
 os.environ['DGLBACKEND'] = 'pytorch'
@@ -12,13 +12,15 @@ from src.utils.args import *
 from src.utils.ot_utils import *
 from src.utils.zero_copy_from_numpy import *
 from src.utils.io import create_dir
+from src.reorderpdb import reorder_pdb
 
+print("Using device:", torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
 
 dataset = 'dips'
-method_name = 'equidock'
+method_name = 'patching'
 remove_clashes = True  # Set to true if you want to remove (most of the) steric clashes. Will increase run time.
 if remove_clashes:
-    method_name = method_name + '_no_clashes'
+    #method_name = method_name + '_no_clashes'
     print('Inference with postprocessing to remove clashes')
 else:
     print('Inference without any postprocessing to remove clashes')
@@ -104,6 +106,15 @@ def main(args):
     args['n_jobs'] = 1
     args['worker'] = 0
 
+    receptor_filename = '/home/mubale/BindingTestSet/Targets/PSMA.pdb'
+    ppdb_receptor = PandasPdb().read_pdb(receptor_filename).df['ATOM']
+    chain = "A"   # set correctly if needed
+    pdb_residues = ppdb_receptor[ppdb_receptor['chain_id'] == chain]['residue_number'].unique()
+
+    patch_residue_ids = list(range(50, 150))
+    patch_residue_ids = [i for i, r in enumerate(pdb_residues) if r in patch_residue_ids]
+    args['patch_residue_ids'] = patch_residue_ids  # add to args
+
 
     model = create_model(args, log)
     model.load_state_dict(checkpoint['state_dict'])
@@ -127,19 +138,18 @@ def main(args):
     # output_dir = './test_sets_pdb/jean_out/'
     # # create_dir(output_dir)
 
-    input_dir = '/mnt/datastore/mubale/BindingTestSet/Binders' # folder with our binders
+    input_dir = '/home/mubale/BindingTestSet/patch_testing' # folder with our binders after RFdiffusion
 
     pdb_files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f)) and f.endswith('.pdb')]
     for file in pdb_files:
 
-        if 'RFDiffusion' in file: # our PSMA designs
-            receptor_filename = '/mnt/datastore/mubale/BindingTestSet/Targets/PSMA.pdb'
-            output_dir = '/home/mubale/equidock_outputs/PSMA'
+        if 'testbinder' in file: # our PSMA designs
+            receptor_filename = '/home/mubale/BindingTestSet/Targets/PSMA.pdb'
+            output_dir = '/home/mubale/BindingTestSet/patch_testing/outputs'
         else: # Adaptyv EGFR designs
-            receptor_filename = '/mnt/datastore/mubale/BindingTestSet/Targets/EGFR.pdb'
-            output_dir = '/home/mubale/equidock_outputs/EGFR'
+            receptor_filename = '/home/mubale/BindingTestSet/Targets/EGFR_1MOX.pdb'
+            output_dir = '/home/mubale/equidock_outputs/DB5/EGFR'
 
-            
         ## specific naming convention for DB5 dataset
         # if not file.endswith('_l_b.pdb'):
         #     continue
@@ -244,8 +254,26 @@ def main(args):
 
 
         ppdb_ligand.df['ATOM'][['x_coord', 'y_coord', 'z_coord']] = ligand_th.detach().numpy() # unbound_ligand_new_pos
-        unbound_ligand_save_filename = os.path.join(output_dir, out_filename)
-        ppdb_ligand.to_pdb(path=unbound_ligand_save_filename, records=['ATOM'], gz=False)
+
+        # equidock's outputting doesnt merge the receptor coordinates with the transformed ligand. this code chunk should fix that...
+        ppdb_receptor = PandasPdb().read_pdb(receptor_filename)
+
+        # set chain IDs for complex
+        # ppdb_receptor.df['ATOM']['chain_id'] = 'A'
+        ppdb_ligand.df['ATOM']['chain_id'] = 'H'
+        num_ligand_atoms = len(ppdb_ligand.df['ATOM'])
+        ppdb_receptor.df['ATOM']['atom_number'] = range(num_ligand_atoms + 1,
+                                               num_ligand_atoms + 1 + len(ppdb_receptor.df['ATOM'])) # renumber the receptor
+        
+        ppdb_ligand.df['ATOM'].reset_index(drop=True, inplace=True)
+        ppdb_receptor.df['ATOM'].reset_index(drop=True, inplace=True)
+
+        # save complex rather than just ligand
+        # unbound_ligand_save_filename = os.path.join(output_dir, out_filename)
+        # ppdb_ligand.to_pdb(path=unbound_ligand_save_filename, records=['ATOM'], gz=False)
+        ppdb_complex = PandasPdb()
+        ppdb_complex.df['ATOM'] = pd.concat([ppdb_ligand.df['ATOM'], ppdb_receptor.df['ATOM']], ignore_index=True)
+        reorder_pdb(ppdb_complex, os.path.join(output_dir, out_filename))
 
         end = dt.now()
         time_list.append((end-start).total_seconds())

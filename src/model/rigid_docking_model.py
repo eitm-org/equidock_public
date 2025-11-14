@@ -1,11 +1,12 @@
 import math
+import sys
 
 import dgl
 import torch
 from torch import nn
 from dgl import function as fn
 from src.utils.graph_norm import GraphNorm
-import sys
+
 
 def get_non_lin(type, negative_slope):
     if type == 'swish':
@@ -42,41 +43,98 @@ def apply_final_h_layer_norm(g, h, node_type, norm_type, norm_layer):
     return norm_layer(h)
 
 
+def compute_cross_attention(queries, keys, values, connectivity_mask, cross_msgs, weight_mask=None):
+    """Compute cross attention with optional per-pair weight mask.
 
-def compute_cross_attention(queries, keys, values, mask, cross_msgs):
-    """Compute cross attention.
-    x_i attend to y_j:
-    a_{i->j} = exp(sim(x_i, y_j)) / sum_j exp(sim(x_i, y_j))
-    attention_x = sum_j a_{i->j} y_j
-    Args:
-      queries: NxD float tensor --> queries
-      keys: MxD float tensor --> keys
-      values: Mxd
-      mask: NxM
-    Returns:
-      attention_x: Nxd float tensor.
+    connectivity_mask: binary NxM tensor (0/1) used to block impossible pairs.
+    weight_mask: float NxM tensor used to scale logits (e.g. upweight patch columns).
+    If cross_msgs is False, returns zeros (same shape as queries).
     """
     if not cross_msgs:
         return queries * 0.
-    a = mask * torch.mm(queries, torch.transpose(keys, 1, 0)) - 1000. * (1. - mask)
-    a_x = torch.softmax(a, dim=1)  # i->j, NxM, a_x.sum(dim=1) = torch.ones(N)
-    attention_x = torch.mm(a_x, values)  # (N,d)
+
+    # raw similarity: NxM
+    sim = torch.mm(queries, keys.transpose(1, 0))
+
+    if weight_mask is None:
+        weight_mask = torch.ones_like(sim, device=sim.device, dtype=sim.dtype)
+
+    # apply soft weighting to similarities
+    logits = sim * weight_mask
+
+    # suppress impossible pairs (connectivity mask keeps allowed entries)
+    logits = logits - 1000.0 * (1.0 - connectivity_mask)
+
+    att = torch.softmax(logits, dim=1)  # NxM
+    attention_x = torch.mm(att, values)  # NxD
     return attention_x
 
 
+def get_mask_and_weights(ligand_batch_num_nodes, receptor_batch_num_nodes, device,
+                         patch_residue_ids=None, patch_weight=1.0, non_patch_weight=1.0):
+    """
+    Build connectivity_mask (binary) and weight_mask (float) for batched ligand/receptor pairs.
 
-def get_mask(ligand_batch_num_nodes, receptor_batch_num_nodes, device):
+    - ligand_batch_num_nodes: list of ints (per-sample ligand node counts)
+    - receptor_batch_num_nodes: list of ints (per-sample receptor node counts)
+    - patch_residue_ids:
+        * None -> no special weights
+        * list of ints -> treat as the same patch indices for every sample (indices are local 0..r_n-1 per sample)
+        * list-of-lists -> per-sample local indices (length must match number of samples)
+    - patch_weight: float > 1 to upweight patch columns (or <1 to downweight them)
+    - non_patch_weight: float applied to non-patch columns (for stronger contrast set <1)
+
+    NOTE: patch_residue_ids must be indices **relative to each receptor node list** (0..m-1).
+    If you have global node IDs, convert them to local per-sample indices before calling this.
+    """
     rows = sum(ligand_batch_num_nodes)
     cols = sum(receptor_batch_num_nodes)
-    mask = torch.zeros(rows, cols).to(device)
+    connectivity_mask = torch.zeros(rows, cols, device=device, dtype=torch.float32)
+    weight_mask = torch.ones(rows, cols, device=device, dtype=torch.float32)
+
     partial_l = 0
     partial_r = 0
-    for l_n, r_n in zip(ligand_batch_num_nodes, receptor_batch_num_nodes):
-        mask[partial_l: partial_l + l_n, partial_r: partial_r + r_n] = 1
-        partial_l = partial_l + l_n
-        partial_r = partial_r + r_n
-    return mask
 
+    # normalize patch_residue_ids to per-sample lists
+    if patch_residue_ids is None:
+        per_sample_patch_ids = [None] * len(ligand_batch_num_nodes)
+    else:
+        # if patch_residue_ids is a list-of-lists (first element iterable), use it directly
+        if isinstance(patch_residue_ids, (list, tuple)) and len(patch_residue_ids) > 0 and isinstance(patch_residue_ids[0], (list, tuple)):
+            per_sample_patch_ids = patch_residue_ids
+            if len(per_sample_patch_ids) != len(ligand_batch_num_nodes):
+                raise ValueError("patch_residue_ids length must match batch size when providing per-sample lists")
+        else:
+            # single list: repeat for all samples
+            per_sample_patch_ids = [patch_residue_ids] * len(ligand_batch_num_nodes)
+
+    for i, (l_n, r_n) in enumerate(zip(ligand_batch_num_nodes, receptor_batch_num_nodes)):
+        connectivity_mask[partial_l: partial_l + l_n, partial_r: partial_r + r_n] = 1.0
+
+        patch_ids = per_sample_patch_ids[i]
+        if patch_ids is not None and len(patch_ids) > 0:
+            # ensure indices are ints and within [0, r_n-1]
+            cols_idx = []
+            for p in patch_ids:
+                p_int = int(p)
+                if p_int < 0 or p_int >= r_n:
+                    raise IndexError(f"patch residue index {p_int} out of range for receptor with {r_n} nodes (sample {i})")
+                cols_idx.append(partial_r + p_int)
+
+            # set patch columns to patch_weight and non-patch columns to non_patch_weight
+            rows_slice = slice(partial_l, partial_l + l_n)
+            # First set all columns in this sample to non_patch_weight
+            weight_mask[rows_slice, partial_r: partial_r + r_n] = float(non_patch_weight)
+            # Then set the patch columns to patch_weight
+            weight_mask[rows_slice, cols_idx] = float(patch_weight)
+        else:
+            # no patch ids -> weight mask remains ones for this block (1.0)
+            pass
+
+        partial_l += l_n
+        partial_r += r_n
+
+    return connectivity_mask, weight_mask
 
 
 class IEGMN_Layer(nn.Module):
@@ -87,6 +145,8 @@ class IEGMN_Layer(nn.Module):
             out_feats_dim,  # out dim of h
             fine_tune,
             args,
+            patch_weight=None,
+            patch_residue_ids=None,
             log=None
     ):
 
@@ -115,6 +175,17 @@ class IEGMN_Layer(nn.Module):
 
         self.all_sigmas_dist = [1.5 ** x for x in range(15)]
 
+        # patch weights: prefer args override, then explicit arg, else default 1.0
+        if patch_weight is not None:
+            self.patch_weight = float(patch_weight)
+        else:
+            self.patch_weight = float(args.get('patch_weight', 1.0))
+
+        # non-patch weight: prefer args if provided, else default to 0.1 per user's request
+        self.non_patch_weight = float(args.get('non_patch_weight', 0.1))
+
+        self.patch_residue_ids = patch_residue_ids
+
         # EDGES
         self.edge_mlp = nn.Sequential(
             nn.Linear((h_feats_dim * 2) + input_edge_feats_dim + len(self.all_sigmas_dist), self.out_feats_dim),
@@ -125,7 +196,7 @@ class IEGMN_Layer(nn.Module):
         )
 
         # NODES
-        self.node_norm = nn.Identity() # nn.LayerNorm(h_feats_dim)
+        self.node_norm = nn.Identity()  # nn.LayerNorm(h_feats_dim)
 
         self.att_mlp_Q = nn.Sequential(
             nn.Linear(h_feats_dim, h_feats_dim, bias=False),
@@ -174,7 +245,6 @@ class IEGMN_Layer(nn.Module):
             )
         # self.reset_parameters()
 
-
     def reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
@@ -185,10 +255,10 @@ class IEGMN_Layer(nn.Module):
     def apply_edges1(self, edges):
         return {'cat_feat': torch.cat([edges.src['feat'], edges.dst['feat']], dim=1)}
 
-
     def forward(self, hetero_graph,
                 coors_ligand, h_feats_ligand, original_ligand_node_features, original_edge_feats_ligand, orig_coors_ligand,
-                coors_receptor, h_feats_receptor, original_receptor_node_features, original_edge_feats_receptor, orig_coors_receptor):
+                coors_receptor, h_feats_receptor, original_receptor_node_features, original_edge_feats_receptor, orig_coors_receptor,
+                patch_residue_ids):  # adding in patch_residue_ids for targetted docking
 
         with hetero_graph.local_scope():
             hetero_graph.nodes['ligand'].data['x_now'] = coors_ligand
@@ -200,13 +270,12 @@ class IEGMN_Layer(nn.Module):
                 self.log(torch.max(hetero_graph.nodes['ligand'].data['x_now']), 'x_now : x_i at layer entrance')
                 self.log(torch.max(hetero_graph.nodes['ligand'].data['feat']), 'data[feat] = h_i at layer entrance')
 
-
-            hetero_graph.apply_edges(fn.u_sub_v('x_now', 'x_now', 'x_rel'), etype=('ligand', 'll', 'ligand')) ## x_i - x_j
+            # compute relative coords for intra-node edges
+            hetero_graph.apply_edges(fn.u_sub_v('x_now', 'x_now', 'x_rel'), etype=('ligand', 'll', 'ligand'))
             hetero_graph.apply_edges(fn.u_sub_v('x_now', 'x_now', 'x_rel'), etype=('receptor', 'rr', 'receptor'))
 
-
             x_rel_mag_ligand = hetero_graph.edges[('ligand', 'll', 'ligand')].data['x_rel'] ** 2
-            x_rel_mag_ligand = torch.sum(x_rel_mag_ligand, dim=1, keepdim=True)   ## ||x_i - x_j||^2 : (N_res, 1)
+            x_rel_mag_ligand = torch.sum(x_rel_mag_ligand, dim=1, keepdim=True)  # ||x_i - x_j||^2 : (N_res, 1)
             x_rel_mag_ligand = torch.cat([torch.exp(-x_rel_mag_ligand / sigma) for sigma in self.all_sigmas_dist], dim=-1)
 
             x_rel_mag_receptor = hetero_graph.edges[('receptor', 'rr', 'receptor')].data['x_rel'] ** 2
@@ -219,14 +288,24 @@ class IEGMN_Layer(nn.Module):
 
             if self.debug:
                 self.log(torch.max(hetero_graph.edges[('ligand', 'll', 'ligand')].data['x_rel']), 'x_rel : x_i - x_j')
-                self.log(torch.max(x_rel_mag_ligand,dim=0).values, 'x_rel_mag_ligand = [exp(-||x_i - x_j||^2 / sigma) for sigma = 1.5 ** x, x = [0, 15]]')
+                self.log(torch.max(x_rel_mag_ligand, dim=0).values,
+                         'x_rel_mag_ligand = [exp(-||x_i - x_j||^2 / sigma) for sigma = 1.5 ** x, x = [0, 15]]')
 
+            # ----- build connectivity and weight masks for cross-attention -----
+            connectivity_mask, weight_mask = get_mask_and_weights(
+                hetero_graph.batch_num_nodes('ligand'),
+                hetero_graph.batch_num_nodes('receptor'),
+                self.device,
+                patch_residue_ids=patch_residue_ids if patch_residue_ids is not None else self.patch_residue_ids,
+                patch_weight=self.patch_weight,
+                non_patch_weight=self.non_patch_weight
+            )
 
-
+            # prepare edge features/messages
             hetero_graph.apply_edges(self.apply_edges1, etype=('ligand', 'll', 'ligand'))  ## i->j edge:  [h_i h_j]
             hetero_graph.apply_edges(self.apply_edges1, etype=('receptor', 'rr', 'receptor'))
 
-            cat_input_for_msg_ligand = torch.cat((hetero_graph.edges['ll'].data['cat_feat'], # [h_i h_j]
+            cat_input_for_msg_ligand = torch.cat((hetero_graph.edges['ll'].data['cat_feat'],  # [h_i h_j]
                                                   original_edge_feats_ligand,
                                                   x_rel_mag_ligand), dim=-1)
             cat_input_for_msg_receptor = torch.cat((hetero_graph.edges['rr'].data['cat_feat'],
@@ -239,50 +318,51 @@ class IEGMN_Layer(nn.Module):
             if self.debug:
                 self.log(torch.max(hetero_graph.edges['ll'].data['msg']), 'data[msg] = m_{i->j} = phi^e(h_i, h_j, f_{i,j}, x_rel_mag_ligand)')
 
+            # \mu_i : cross attention (ligand attends to receptor and vice versa) using weight mask
+            hetero_graph.nodes['ligand'].data['aggr_cross_msg'] = compute_cross_attention(
+                self.att_mlp_Q(h_feats_ligand),
+                self.att_mlp_K(h_feats_receptor),
+                self.att_mlp_V(h_feats_receptor),
+                connectivity_mask,
+                self.cross_msgs,
+                weight_mask=weight_mask
+            )
 
-
-            mask = get_mask(hetero_graph.batch_num_nodes('ligand'), hetero_graph.batch_num_nodes('receptor'), self.device)
-
-            # \mu_i
-            hetero_graph.nodes['ligand'].data['aggr_cross_msg'] = compute_cross_attention(self.att_mlp_Q(h_feats_ligand),
-                                                                                          self.att_mlp_K(h_feats_receptor),
-                                                                                          self.att_mlp_V(h_feats_receptor),
-                                                                                          mask,
-                                                                                          self.cross_msgs)
-            hetero_graph.nodes['receptor'].data['aggr_cross_msg'] = compute_cross_attention(self.att_mlp_Q(h_feats_receptor),
-                                                                                            self.att_mlp_K(h_feats_ligand),
-                                                                                            self.att_mlp_V(h_feats_ligand),
-                                                                                            mask.transpose(0,1),
-                                                                                            self.cross_msgs)
+            hetero_graph.nodes['receptor'].data['aggr_cross_msg'] = compute_cross_attention(
+                self.att_mlp_Q(h_feats_receptor),
+                self.att_mlp_K(h_feats_ligand),
+                self.att_mlp_V(h_feats_ligand),
+                connectivity_mask.transpose(0, 1),
+                self.cross_msgs,
+                weight_mask=weight_mask.transpose(0, 1)
+            )
 
             if self.debug:
-                self.log(torch.max(hetero_graph.nodes['ligand'].data['aggr_cross_msg']), 'aggr_cross_msg(i) = sum_j a_{i,j} * h_j')
+                self.log(torch.max(hetero_graph.nodes['ligand'].data['aggr_cross_msg']),
+                         'aggr_cross_msg(i) = sum_j a_{i,j} * h_j')
 
-
-
+            # coordinate update edge moments
             edge_coef_ligand = self.coors_mlp(hetero_graph.edges['ll'].data['msg'])  # \phi^x(m_{i->j})
-            hetero_graph.edges['ll'].data['x_moment'] = hetero_graph.edges['ll'].data['x_rel'] * edge_coef_ligand # (x_i - x_j) * \phi^x(m_{i->j})
+            hetero_graph.edges['ll'].data['x_moment'] = hetero_graph.edges['ll'].data['x_rel'] * edge_coef_ligand
             edge_coef_receptor = self.coors_mlp(hetero_graph.edges['rr'].data['msg'])
             hetero_graph.edges['rr'].data['x_moment'] = hetero_graph.edges['rr'].data['x_rel'] * edge_coef_receptor
-
 
             if self.debug:
                 self.log(torch.max(edge_coef_ligand), 'edge_coef_ligand : \phi^x(m_{i->j})')
                 self.log(torch.max(hetero_graph.edges['ll'].data['x_moment']), 'data[x_moment] = (x_i - x_j) * \phi^x(m_{i->j})')
 
-
-            hetero_graph.update_all(fn.copy_edge('x_moment', 'm'), fn.mean('m', 'x_update'),
+            # aggregate
+            hetero_graph.update_all(fn.copy_e('x_moment', 'm'), fn.mean('m', 'x_update'),
                                     etype=('ligand', 'll', 'ligand'))
-            hetero_graph.update_all(fn.copy_edge('x_moment', 'm'), fn.mean('m', 'x_update'),
+            hetero_graph.update_all(fn.copy_e('x_moment', 'm'), fn.mean('m', 'x_update'),
                                     etype=('receptor', 'rr', 'receptor'))
 
-
-            hetero_graph.update_all(fn.copy_edge('msg', 'm'), fn.mean('m', 'aggr_msg'),
+            hetero_graph.update_all(fn.copy_e('msg', 'm'), fn.mean('m', 'aggr_msg'),
                                     etype=('ligand', 'll', 'ligand'))
-            hetero_graph.update_all(fn.copy_edge('msg', 'm'), fn.mean('m', 'aggr_msg'),
+            hetero_graph.update_all(fn.copy_e('msg', 'm'), fn.mean('m', 'aggr_msg'),
                                     etype=('receptor', 'rr', 'receptor'))
 
-
+            # final coordinate combination
             x_final_ligand = self.x_connection_init * orig_coors_ligand + \
                              (1. - self.x_connection_init) * hetero_graph.nodes['ligand'].data['x_now'] + \
                              hetero_graph.nodes['ligand'].data['x_update']
@@ -291,6 +371,7 @@ class IEGMN_Layer(nn.Module):
                                (1. - self.x_connection_init) * hetero_graph.nodes['receptor'].data['x_now'] + \
                                hetero_graph.nodes['receptor'].data['x_update']
 
+            # fine-tune cross-coord attention (use same masks)
             if self.fine_tune:
                 x_final_ligand = x_final_ligand + \
                                  self.att_mlp_cross_coors_V(h_feats_ligand) * (
@@ -298,24 +379,27 @@ class IEGMN_Layer(nn.Module):
                                          compute_cross_attention(self.att_mlp_cross_coors_Q(h_feats_ligand),
                                                                  self.att_mlp_cross_coors_K(h_feats_receptor),
                                                                  hetero_graph.nodes['receptor'].data['x_now'],
-                                                                 mask,
-                                                                 self.cross_msgs))
+                                                                 connectivity_mask,
+                                                                 self.cross_msgs,
+                                                                 weight_mask=weight_mask)
+                                 )
                 x_final_receptor = x_final_receptor + \
                                    self.att_mlp_cross_coors_V(h_feats_receptor) * (
                                            hetero_graph.nodes['receptor'].data['x_now'] -
                                            compute_cross_attention(self.att_mlp_cross_coors_Q(h_feats_receptor),
                                                                    self.att_mlp_cross_coors_K(h_feats_ligand),
                                                                    hetero_graph.nodes['ligand'].data['x_now'],
-                                                                   mask.transpose(0,1),
-                                                                   self.cross_msgs))
-
+                                                                   connectivity_mask.transpose(0, 1),
+                                                                   self.cross_msgs,
+                                                                   weight_mask=weight_mask.transpose(0, 1))
+                                   )
 
             if self.debug:
-                self.log(torch.max(hetero_graph.nodes['ligand'].data['aggr_msg']), 'data[aggr_msg]: \sum_j m_{i->j} ')
-                self.log(torch.max(hetero_graph.nodes['ligand'].data['x_update']), 'data[x_update] : \sum_j (x_i - x_j) * \phi^x(m_{i->j})')
+                self.log(torch.max(hetero_graph.nodes['ligand'].data['aggr_msg']), 'data[aggr_msg]: \\sum_j m_{i->j} ')
+                self.log(torch.max(hetero_graph.nodes['ligand'].data['x_update']), 'data[x_update] : \\sum_j (x_i - x_j) * \\phi^x(m_{i->j})')
                 self.log(torch.max(x_final_ligand), 'x_i new = x_final_ligand : x_i + data[x_update]')
 
-
+            # node updates
             input_node_upd_ligand = torch.cat((self.node_norm(hetero_graph.nodes['ligand'].data['feat']),
                                                hetero_graph.nodes['ligand'].data['aggr_msg'],
                                                hetero_graph.nodes['ligand'].data['aggr_cross_msg'],
@@ -343,14 +427,10 @@ class IEGMN_Layer(nn.Module):
                 self.log(torch.max(input_node_upd_ligand), 'concat(h_i, aggr_msg, aggr_cross_msg)')
                 self.log(torch.max(node_upd_ligand), 'h_i new = h_i + MLP(h_i, aggr_msg, aggr_cross_msg)')
 
-
-
             node_upd_ligand = apply_final_h_layer_norm(hetero_graph, node_upd_ligand, 'ligand', self.final_h_layer_norm, self.final_h_layernorm_layer)
             node_upd_receptor = apply_final_h_layer_norm(hetero_graph, node_upd_receptor, 'receptor', self.final_h_layer_norm, self.final_h_layernorm_layer)
 
-
             return x_final_ligand, node_upd_ligand, x_final_receptor, node_upd_receptor
-
 
     def __repr__(self):
         return "IEGMN Layer " + str(self.__dict__)
@@ -364,7 +444,7 @@ class IEGMN(nn.Module):
         super(IEGMN, self).__init__()
 
         self.debug = args['debug']
-        self.log=log
+        self.log = log
 
         self.device = args['device']
         self.graph_nodes = args['graph_nodes']
@@ -377,15 +457,17 @@ class IEGMN(nn.Module):
         self.use_edge_features_in_gmn = args['use_edge_features_in_gmn']
 
         self.use_mean_node_features = args['use_mean_node_features']
+        # read patch_residue_ids from args (can be None, list, or list-of-lists)
+        self.patch_residue_ids = args.get('patch_residue_ids', None)
 
         # 21 types of amino-acid types
         self.residue_emb_layer = nn.Embedding(num_embeddings=21, embedding_dim=args['residue_emb_dim'])
 
         assert self.graph_nodes == 'residues'
-        input_node_feats_dim = args['residue_emb_dim'] ## One residue type
+        input_node_feats_dim = args['residue_emb_dim']  ## One residue type
 
         if self.use_mean_node_features:
-            input_node_feats_dim += 5 ### Additional features from mu_r_norm
+            input_node_feats_dim += 5  ### Additional features from mu_r_norm
 
         self.iegmn_layers = nn.ModuleList()
 
@@ -394,6 +476,8 @@ class IEGMN(nn.Module):
                         h_feats_dim=input_node_feats_dim,
                         out_feats_dim=args['iegmn_lay_hid_dim'],
                         fine_tune=fine_tune,
+                        patch_weight=args.get('patch_weight', 1.0),
+                        patch_residue_ids=self.patch_residue_ids,
                         args=args,
                         log=self.log))
 
@@ -403,6 +487,8 @@ class IEGMN(nn.Module):
                                      out_feats_dim=args['iegmn_lay_hid_dim'],
                                      args=args,
                                      fine_tune=fine_tune,
+                                     patch_weight=args.get('patch_weight', 1.0),
+                                     patch_residue_ids=self.patch_residue_ids,
                                      log=self.log)
             for layer_idx in range(1, n_lays):
                 self.iegmn_layers.append(interm_lay)
@@ -415,8 +501,9 @@ class IEGMN(nn.Module):
                                 out_feats_dim=args['iegmn_lay_hid_dim'],
                                 args=args,
                                 fine_tune=fine_tune,
+                                patch_weight=args.get('patch_weight', 1.0),
+                                patch_residue_ids=self.patch_residue_ids,
                                 log=self.log))
-
 
         assert args['rot_model'] == 'kb_att'
 
@@ -439,14 +526,12 @@ class IEGMN(nn.Module):
 
         # self.reset_parameters()
 
-
     def reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
                 torch.nn.init.xavier_normal_(p, gain=1.)
             else:
                 torch.nn.init.zeros_(p)
-
 
     def forward(self, batch_hetero_graph, epoch):
         orig_coors_ligand = batch_hetero_graph.nodes['ligand'].data['new_x']
@@ -497,7 +582,8 @@ class IEGMN(nn.Module):
                                      h_feats_receptor=h_feats_receptor,
                                      original_receptor_node_features=original_receptor_node_features,
                                      original_edge_feats_receptor=original_edge_feats_receptor,
-                                     orig_coors_receptor=orig_coors_receptor
+                                     orig_coors_receptor=orig_coors_receptor,
+                                     patch_residue_ids=self.patch_residue_ids
                                      )
 
         if self.debug:
@@ -516,40 +602,36 @@ class IEGMN(nn.Module):
         all_Y_receptor_att_ROT_list = []
         all_Y_ligand_att_ROT_list = []
 
-
         ### TODO: run SVD in batches, if possible
         for the_idx, hetero_graph in enumerate(list_hetero_graph):
 
             # Get H vectors
-            H_receptor_feats = hetero_graph.nodes['receptor'].data['hv_iegmn_out'] # (m, d)
-            H_receptor_feats_att_mean_ROT = torch.mean(self.mlp_h_mean_ROT(H_receptor_feats), dim=0, keepdim=True) # (1, d)
+            H_receptor_feats = hetero_graph.nodes['receptor'].data['hv_iegmn_out']  # (m, d)
+            H_receptor_feats_att_mean_ROT = torch.mean(self.mlp_h_mean_ROT(H_receptor_feats), dim=0, keepdim=True)  # (1, d)
 
-
-            H_ligand_feats = hetero_graph.nodes['ligand'].data['hv_iegmn_out'] # (n, d)
-            H_ligand_feats_att_mean_ROT = torch.mean(self.mlp_h_mean_ROT(H_ligand_feats), dim=0, keepdim=True) # (1, d)
+            H_ligand_feats = hetero_graph.nodes['ligand'].data['hv_iegmn_out']  # (n, d)
+            H_ligand_feats_att_mean_ROT = torch.mean(self.mlp_h_mean_ROT(H_ligand_feats), dim=0, keepdim=True)  # (1, d)
 
             d = H_ligand_feats.shape[1]
             assert d == self.out_feats_dim
 
             # Z coordinates
             Z_receptor_coors = hetero_graph.nodes['receptor'].data['x_iegmn_out']
-
             Z_ligand_coors = hetero_graph.nodes['ligand'].data['x_iegmn_out']
 
-
             #################### AP 1: compute two point clouds of K_heads points each, then do Kabsch  #########################
-            # Att weights to compute the receptor centroid. They query is the average_h_ligand. Keys are each h_receptor_j
+            # Att weights to compute the receptor centroid. Query is average_h_ligand; Keys are each h_receptor_j
+
             att_weights_receptor_ROT = torch.softmax(
                 self.att_mlp_key_ROT(H_receptor_feats).view(-1, self.num_att_heads, d).transpose(0, 1) @  # (K_heads, m_rec, d)
-                self.att_mlp_query_ROT(H_ligand_feats_att_mean_ROT).view(1, self.num_att_heads, d).transpose(0, 1).transpose(1, 2) /  # (K_heads, d, 1)
-                math.sqrt(d), # (K_heads, m_receptor, 1)
+                self.att_mlp_query_ROT(H_ligand_feats_att_mean_ROT).view(1, self.num_att_heads, d).transpose(0, 1).transpose(1, 2) /
+                math.sqrt(d),  # (K_heads, m_receptor, 1)
                 dim=1).view(self.num_att_heads, -1)
 
             Y_receptor_att_ROT = att_weights_receptor_ROT @ Z_receptor_coors  # K_heads, 3
             all_Y_receptor_att_ROT_list.append(Y_receptor_att_ROT)
 
-
-            # Att weights to compute the ligand centroid. They query is the average_h_receptor. Keys are each h_ligand_i
+            # Att weights to compute the ligand centroid. Query is average_h_receptor; Keys are each h_ligand_i
             att_weights_ligand_ROT = torch.softmax(
                 self.att_mlp_key_ROT(H_ligand_feats).view(-1, self.num_att_heads, d).transpose(0, 1) @
                 self.att_mlp_query_ROT(H_receptor_feats_att_mean_ROT).view(1, self.num_att_heads, d).transpose(0, 1).transpose(1, 2) /
@@ -560,22 +642,21 @@ class IEGMN(nn.Module):
             all_Y_ligand_att_ROT_list.append(Y_ligand_att_ROT)
 
             ## Apply Kabsch algorithm
-            Y_receptor_att_ROT_mean = Y_receptor_att_ROT.mean(dim=0, keepdim=True) # (1,3)
-            Y_ligand_att_ROT_mean = Y_ligand_att_ROT.mean(dim=0, keepdim=True) # (1,3)
+            Y_receptor_att_ROT_mean = Y_receptor_att_ROT.mean(dim=0, keepdim=True)  # (1,3)
+            Y_ligand_att_ROT_mean = Y_ligand_att_ROT.mean(dim=0, keepdim=True)  # (1,3)
 
-
-            A = (Y_receptor_att_ROT - Y_receptor_att_ROT_mean).transpose(0,1) @ (Y_ligand_att_ROT - Y_ligand_att_ROT_mean) # 3, 3
-
+            A = (Y_receptor_att_ROT - Y_receptor_att_ROT_mean).transpose(0, 1) @ (
+                    Y_ligand_att_ROT - Y_ligand_att_ROT_mean)  # 3, 3
 
             assert not torch.isnan(A).any()
             U, S, Vt = torch.linalg.svd(A)
 
             num_it = 0
-            while torch.min(S) < 1e-3 or torch.min(torch.abs((S**2).view(1,3) - (S**2).view(3,1) + torch.eye(3).to(self.device))) < 1e-2:
+            while torch.min(S) < 1e-3 or torch.min(torch.abs((S ** 2).view(1, 3) - (S ** 2).view(3, 1) + torch.eye(3).to(self.device))) < 1e-2:
                 if self.debug:
                     self.log('S inside loop ', num_it, ' is ', S, ' and A = ', A)
 
-                A = A + torch.rand(3,3).to(self.device) * torch.eye(3).to(self.device)
+                A = A + torch.rand(3, 3).to(self.device) * torch.eye(3).to(self.device)
                 U, S, Vt = torch.linalg.svd(A)
                 num_it += 1
 
@@ -583,27 +664,23 @@ class IEGMN(nn.Module):
                     self.log('SVD consistently numerically unstable! Exitting ... ')
                     sys.exit(1)
 
-            corr_mat = torch.diag(torch.Tensor([1,1,torch.sign(torch.det(A))])).to(self.device)
-            T_align = (U @  corr_mat) @ Vt
+            corr_mat = torch.diag(torch.Tensor([1, 1, torch.sign(torch.det(A))])).to(self.device)
+            T_align = (U @ corr_mat) @ Vt
 
             b_align = Y_receptor_att_ROT_mean - torch.t(T_align @ Y_ligand_att_ROT_mean.t())  # (1,3)
-
-
-        #################### end AP 1 #########################
 
             if self.debug:
                 self.log('Y_receptor_att_ROT_mean', Y_receptor_att_ROT_mean)
                 self.log('Y_ligand_att_ROT_mean', Y_ligand_att_ROT_mean)
-
 
             all_T_align_list.append(T_align)
             all_b_align_list.append(b_align)
 
         return [all_T_align_list, all_b_align_list, all_Y_ligand_att_ROT_list, all_Y_receptor_att_ROT_list]
 
-
     def __repr__(self):
         return "IEGMN " + str(self.__dict__)
+
 
 # =================================================================================================================
 
@@ -615,7 +692,7 @@ class Rigid_Body_Docking_Net(nn.Module):
         super(Rigid_Body_Docking_Net, self).__init__()
 
         self.debug = args['debug']
-        self.log=log
+        self.log = log
 
         self.device = args['device']
 
@@ -624,10 +701,9 @@ class Rigid_Body_Docking_Net(nn.Module):
             self.iegmn_fine_tune = IEGMN(args, n_lays=2, fine_tune=True, log=log)
             self.list_iegmns = [('original', self.iegmn_original), ('finetune', self.iegmn_fine_tune)]
         else:
-            self.list_iegmns = [('finetune', self.iegmn_original)] ## just original
+            self.list_iegmns = [('finetune', self.iegmn_original)]  ## just original
 
         # self.reset_parameters()
-
 
     def reset_parameters(self):
         for p in self.parameters():
@@ -635,8 +711,6 @@ class Rigid_Body_Docking_Net(nn.Module):
                 torch.nn.init.xavier_normal_(p, gain=1.)
             else:
                 torch.nn.init.zeros_(p)
-
-
 
     ####### FORWARD for Rigid_Body_Docking_Net
     def forward(self, batch_hetero_graph, epoch):
@@ -662,7 +736,7 @@ class Rigid_Body_Docking_Net(nn.Module):
                 b_align = outputs[1][the_idx]
                 assert b_align.shape[0] == 1 and b_align.shape[1] == 3
 
-                inner_coors_ligand = ( T_align @ orig_coors_ligand.t() ).t() + b_align  # (n,3)
+                inner_coors_ligand = (T_align @ orig_coors_ligand.t()).t() + b_align  # (n,3)
 
                 if stage == 'original':
                     hetero_graph.nodes['ligand'].data['new_x'] = inner_coors_ligand
@@ -681,7 +755,6 @@ class Rigid_Body_Docking_Net(nn.Module):
             if stage == 'original':
                 batch_hetero_graph = dgl.batch(new_list_hetero_graph)
 
-
         all_keypts_ligand_list = last_outputs[2]
         all_keypts_receptor_list = last_outputs[3]
         all_rotation_list = last_outputs[0]
@@ -690,7 +763,6 @@ class Rigid_Body_Docking_Net(nn.Module):
         return all_ligand_coors_deform_list, \
                all_keypts_ligand_list, all_keypts_receptor_list, \
                all_rotation_list, all_translation_list
-
 
     def __repr__(self):
         return "Rigid_Body_Docking_Net " + str(self.__dict__)
